@@ -1,0 +1,125 @@
+services:
+  # ---------- Milvus 依赖：etcd (元数据) ----------
+  etcd:
+    container_name: smart-agent-etcd
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ---------- Milvus 依赖：MinIO (对象存储, 仅内网) ----------
+  milvus-minio:
+    container_name: smart-agent-milvus-minio
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: ${MILVUS_MINIO_ACCESS_KEY:-change-this-minio-access-key}
+      MINIO_SECRET_KEY: ${MILVUS_MINIO_SECRET_KEY:-change-this-minio-secret-key}
+      MINIO_ROOT_USER: ${MILVUS_MINIO_ACCESS_KEY:-change-this-minio-access-key}
+      MINIO_ROOT_PASSWORD: ${MILVUS_MINIO_SECRET_KEY:-change-this-minio-secret-key}
+    volumes:
+      - ./volumes/milvus-minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    # 不暴露端口到宿主机，避免与外部 MinIO 实例（见 .env 的 MINIO_ENDPOINT）冲突
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # ---------- Milvus 向量数据库 ----------
+  milvus:
+    container_name: smart-agent-milvus
+    image: milvusdb/milvus:v2.5.10
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+      MINIO_ACCESS_KEY: ${MILVUS_MINIO_ACCESS_KEY:-change-this-minio-access-key}
+      MINIO_SECRET_KEY: ${MILVUS_MINIO_SECRET_KEY:-change-this-minio-secret-key}
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"   # gRPC (pymilvus)
+      - "9091:9091"     # HTTP / metrics
+    depends_on:
+      - etcd
+      - milvus-minio
+
+  # ---------- Neo4j 知识图谱 ----------
+  neo4j:
+    container_name: smart-agent-neo4j
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-change-this-neo4j-password}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      # 注意：Neo4j 5.26 strict_validation 不认识 server.memory.pagecache.size，
+      # 这里不再显式设置，让 Neo4j 根据宿主机可用内存自动分配 pagecache。
+    ports:
+      - "7474:7474"   # HTTP Browser UI
+      - "7687:7687"   # Bolt driver
+    volumes:
+      - ./volumes/neo4j/data:/data
+      - ./volumes/neo4j/logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ---------- Attu Milvus 可视化管理 UI ----------
+  attu:
+    container_name: smart-agent-attu
+    image: zilliz/attu:v2.5
+    environment:
+      # 容器之间通过服务名互通；不要用 localhost
+      MILVUS_URL: smart-agent-milvus:19530
+    ports:
+      - "8002:3000"   # 宿主机 8002 → 容器 3000，避开 8000/8001 业务端口
+    depends_on:
+      milvus:
+        condition: service_healthy
+
+  # ---------- MongoDB 聊天历史存储 ----------
+  mongo:
+    container_name: smart-agent-mongo
+    image: mongo:6.0    # 6.0 比 7.0 更稳定
+    platform: linux/amd64
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-kbadmin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-change-this-mongo-password}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db    # 用 Docker 命名卷，避免 Windows bind mount 权限问题
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  mongo_data:    # Docker 管理的命名卷，自动放在 Docker Desktop VM 内部
+
+networks:
+  default:
+    name: smart_agent_net
