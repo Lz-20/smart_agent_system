@@ -1,4 +1,4 @@
-# 掌柜智库 Smart Agent System
+#Smart Agent System
 
 基于 **FastAPI + LangGraph + Milvus + Neo4j + MongoDB + DashScope LLM** 的智能问答与知识库导入系统。
 
